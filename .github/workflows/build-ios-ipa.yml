@@ -1,0 +1,168 @@
+import { useCallback, useEffect, useState } from "react";
+import { Icon } from "./ui/kit";
+import { Home, Library, Search, DetailRouter } from "./ui/screens";
+import { AuthSheet, Settings, SettingsRouter } from "./ui/Settings";
+import { MiniPlayer, NowPlaying } from "./ui/PlayerUI";
+import { PlaylistPicker, TrackMenu } from "./ui/track";
+import { Intro } from "./ui/Onboarding";
+import { navStore, setTab, useNav, type Tab } from "./lib/nav";
+import { useSettings } from "./lib/settings";
+import { t, currentLang } from "./lib/i18n";
+import { initPlayer, usePlayer } from "./lib/player";
+import { initAuth } from "./lib/auth";
+import { initSync } from "./lib/sync";
+import { healthCheck } from "./lib/api";
+import { reconcileDownloads } from "./lib/library";
+import { native } from "./lib/native";
+import { useToasts } from "./lib/toast";
+
+const TABS: [Tab, string, string][] = [
+  ["home", "home", "tab_home"],
+  ["search", "search", "tab_search"],
+  ["library", "library", "tab_library"],
+  ["settings", "sliders", "tab_settings"],
+];
+
+/** Liquid Glass: на iOS 26+ полный эффект, на старых — лёгкое стекло. */
+async function resolveGlass(mode: string): Promise<string> {
+  if (mode !== "auto") return mode;
+  const info = await native.getInfo();
+  if (info) {
+    const major = parseInt(info.systemVersion, 10);
+    if (info.lowPower) return "lite";
+    return major >= 26 ? "liquid" : "lite";
+  }
+  const m = navigator.userAgent.match(/OS (\d+)_/);
+  if (m) return parseInt(m[1], 10) >= 26 ? "liquid" : "lite";
+  return "liquid";
+}
+
+function Toasts() {
+  const { items } = useToasts();
+  return (
+    <div className="pointer-events-none fixed inset-x-0 z-[90] flex flex-col items-center gap-2" style={{ top: "calc(var(--sat) + 10px)" }}>
+      {items.map((i) => (
+        <div key={i.id} className="glass rounded-full px-5 py-3 text-[14px] font-medium" style={{ animation: "toast-in .3s cubic-bezier(.2,.9,.3,1.2)" }}>{i.text}</div>
+      ))}
+    </div>
+  );
+}
+
+export default function App() {
+  const s = useSettings();
+  const nav = useNav();
+  const { queue, index } = usePlayer();
+  const [intro, setIntro] = useState(true);
+  const hasTrack = !!queue[index];
+
+  // инициализация подсистем
+  useEffect(() => {
+    initPlayer();
+    initAuth().then(initSync);
+    healthCheck().catch(() => {});
+    reconcileDownloads();
+    native.getInfo();
+  }, []);
+
+  // язык документа и тема стекла
+  useEffect(() => { document.documentElement.lang = currentLang(); }, [s.lang]);
+  useEffect(() => {
+    let alive = true;
+    resolveGlass(s.glass).then((g) => alive && (document.documentElement.dataset.glass = g));
+    return () => { alive = false; };
+  }, [s.glass]);
+
+  // тактильный отклик можно выключить
+  useEffect(() => {
+    const original = native.haptic;
+    native.haptic = (style) => (s.haptics ? original.call(native, style) : Promise.resolve(undefined));
+    return () => { native.haptic = original; };
+  }, [s.haptics]);
+
+  // клавиатура: подгоняем высоту под visualViewport, чтобы поиск не перекрывался
+  useEffect(() => {
+    const vv = window.visualViewport;
+    const apply = () => {
+      const h = vv ? vv.height : window.innerHeight;
+      document.documentElement.style.setProperty("--app-h", `${Math.round(h)}px`);
+      const kb = !!vv && window.innerHeight - vv.height > 120;
+      if (navStore.get().keyboard !== kb) navStore.set({ keyboard: kb });
+      if (window.scrollY !== 0) window.scrollTo(0, 0);
+    };
+    apply();
+    vv?.addEventListener("resize", apply);
+    vv?.addEventListener("scroll", apply);
+    window.addEventListener("orientationchange", apply);
+    return () => {
+      vv?.removeEventListener("resize", apply);
+      vv?.removeEventListener("scroll", apply);
+      window.removeEventListener("orientationchange", apply);
+    };
+  }, []);
+
+  // внешние ссылки открываем в SFSafariViewController
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      const a = (e.target as HTMLElement).closest("a[href]") as HTMLAnchorElement | null;
+      if (!a) return;
+      const href = a.getAttribute("href") ?? "";
+      if (/^https?:\/\//i.test(href) && (a.target === "_blank" || new URL(href).origin !== location.origin)) {
+        e.preventDefault();
+        native.openExternal(href);
+      }
+    };
+    document.addEventListener("click", onClick);
+    // запрещаем контекстное меню на элементах управления
+    const noCtx = (e: Event) => { if (!(e.target as HTMLElement).closest("input,textarea")) e.preventDefault(); };
+    document.addEventListener("contextmenu", noCtx);
+    return () => { document.removeEventListener("click", onClick); document.removeEventListener("contextmenu", noCtx); };
+  }, []);
+
+  const done = useCallback(() => setIntro(false), []);
+  const stackTop = nav.stacks[nav.tab].length > 0;
+  const bottomPad = `calc(var(--sab) + var(--tabbar-h) + ${hasTrack ? 96 : 28}px)`;
+
+  return (
+    <div className="absolute inset-0 overflow-hidden" style={{ paddingLeft: "var(--sal)", paddingRight: "var(--sar)", ["--mini-pad" as string]: hasTrack ? "80px" : "0px" }}>
+      <div className="ambient" />
+      {/* Корневые вкладки сохраняют состояние (скролл, поиск) */}
+      {(["home", "search", "library", "settings"] as Tab[]).map((tab) => (
+        <div key={tab} className="scroll-y absolute inset-0" style={{ display: nav.tab === tab ? "block" : "none", paddingBottom: bottomPad, visibility: stackTop && nav.tab === tab ? "hidden" : "visible" }}>
+          {tab === "home" && <Home />}
+          {tab === "search" && <Search />}
+          {tab === "library" && <Library />}
+          {tab === "settings" && <Settings />}
+        </div>
+      ))}
+      <DetailRouter />
+      <SettingsRouter />
+
+      <MiniPlayer />
+
+      {/* Нижняя панель вкладок (под большой палец), с отступом под Home Indicator */}
+      {!nav.keyboard && (
+        <nav className="glass fixed z-30 flex items-center justify-around rounded-[32px] px-2"
+          style={{ left: "calc(var(--sal) + 10px)", right: "calc(var(--sar) + 10px)", bottom: "calc(var(--sab) + 8px)", height: "var(--tabbar-h)" }}>
+          {TABS.map(([tab, icon, label]) => {
+            const active = nav.tab === tab;
+            return (
+              <button key={tab} onClick={() => setTab(tab)} aria-label={t(label)}
+                className="flex h-[52px] min-w-[64px] flex-1 flex-col items-center justify-center gap-0.5 rounded-[26px] transition-all"
+                style={{ background: active ? "rgba(255,255,255,.16)" : "transparent", color: active ? "#fff" : "rgba(255,255,255,.55)" }}>
+                <Icon name={icon} size={22} fill={active && tab === "home"} />
+                <span className="text-[10.5px] font-medium">{t(label)}</span>
+              </button>
+            );
+          })}
+        </nav>
+      )}
+
+      <NowPlaying />
+      <TrackMenu />
+      <PlaylistPicker />
+      <AuthSheet />
+      <Toasts />
+      {intro && <Intro first={!s.onboarded} onDone={done} />}
+    </div>
+  );
+}
